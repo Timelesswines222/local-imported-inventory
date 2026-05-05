@@ -1,0 +1,8 @@
+{
+  "name": "inventory-local-imported-stock-1",
+  "version": "1.0.0",
+  "dependencies": {
+    "node-fetch": "^2.6.7",
+    "raw-body": "^3.0.2"
+  }
+}
