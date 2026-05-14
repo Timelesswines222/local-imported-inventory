@@ -263,8 +263,11 @@ export default async function handler(req, res) {
       return json;
     }
 
-    // 🔹 Save split plan to order note attributes
-    async function saveSplitPlan(orderId, splitPlan) {
+    /**
+     * Remove inventory_split_plan_v1 from order note_attributes so it does not appear under
+     * Additional details. Preserves all other note attributes.
+     */
+    async function removeSplitPlanNoteAttribute(orderId) {
       try {
         const orderResponse = await fetch(
           `https://${SHOP}/admin/api/2026-04/orders/${orderId}.json?fields=id,note_attributes`,
@@ -285,13 +288,9 @@ export default async function handler(req, res) {
         const attrsWithoutSplitPlan = existingAttrs.filter(
           (attr) => attr?.name !== SPLIT_PLAN_ATTR
         );
-        const mergedNoteAttributes = [
-          ...attrsWithoutSplitPlan,
-          {
-            name: SPLIT_PLAN_ATTR,
-            value: JSON.stringify(splitPlan),
-          },
-        ];
+        if (attrsWithoutSplitPlan.length === existingAttrs.length) {
+          return;
+        }
 
         const response = await fetch(
           `https://${SHOP}/admin/api/2026-04/orders/${orderId}.json`,
@@ -304,27 +303,27 @@ export default async function handler(req, res) {
             body: JSON.stringify({
               order: {
                 id: orderId,
-                note_attributes: mergedNoteAttributes,
+                note_attributes: attrsWithoutSplitPlan,
               },
             }),
           }
         );
 
         const json = await response.json();
-        console.log("📝 Saved split plan status:", response.status);
+        console.log("📝 Removed split plan from note_attributes, status:", response.status);
 
         if (isLikelyAuthOrScopeFailure(response, json)) {
-          throw new Error("Shopify Admin API authentication/scope check failed while saving split plan.");
+          throw new Error("Shopify Admin API authentication/scope check failed while updating order note attributes.");
         }
         if (!response.ok) {
-          throw buildAdminApiError("save split plan", response, json);
+          throw buildAdminApiError("remove split plan note attribute", response, json);
         }
 
         if (json?.errors) {
-          console.log("⚠️ Save split plan errors:", JSON.stringify(json.errors));
+          console.log("⚠️ Remove split plan errors:", JSON.stringify(json.errors));
         }
       } catch (err) {
-        console.log("⚠️ Failed to save split plan:", err.message);
+        console.log("⚠️ Failed to remove split plan from note_attributes:", err.message);
       }
     }
 
@@ -341,6 +340,21 @@ export default async function handler(req, res) {
         console.log("⚠️ Invalid split plan JSON:", err.message);
         return null;
       }
+    }
+
+    /**
+     * Imported first: assign up to IMPORTED capacity, remainder from LOCAL.
+     * Preferring IMPORTED first often keeps the larger fulfillment group on the warehouse FO that
+     * already has checkout shipping (e.g. UPS). Local-only remainder still follows that location's
+     * delivery profile in Shopify admin (pickup vs carrier).
+     */
+    function computeImportedFirstSplit(orderedQty, localCapacity, importedCapacity) {
+      const local = Math.max(0, Number(localCapacity) || 0);
+      const imported = Math.max(0, Number(importedCapacity) || 0);
+      const importedQty = Math.min(orderedQty, imported);
+      const remaining = orderedQty - importedQty;
+      const localQty = Math.min(remaining, local);
+      return { localQty, importedQty };
     }
 
     /**
@@ -397,6 +411,10 @@ export default async function handler(req, res) {
 
     /**
      * Move fulfillment quantities so assigned locations match target localQty / importedQty for this variant.
+     * Fulfillment labels (e.g. "In Store Pickup" vs UPS) come from each location's delivery profile in
+     * Shopify admin, not from this script. If a local FO shows pickup while checkout used shipping,
+     * add carrier rates for that location (Settings → Shipping and delivery) or turn off pickup for
+     * online orders at that location.
      */
     async function rebalanceVariantFulfillment(orderId, variantId, targetLocal, targetImported) {
       const maxIterations = 25;
@@ -472,10 +490,18 @@ export default async function handler(req, res) {
     // ================================================================
     async function handleOrderCreate() {
       const orderId = data.id;
+      const routingMode =
+        String(process.env.INVENTORY_SPLIT_ROUTING || "local_first").toLowerCase() ===
+        "imported_first"
+          ? "imported_first"
+          : "local_first";
       const splitPlan = {
         __meta: {
           inventoryAdjusted: false,
-          routingMode: "local_first_fulfillment",
+          routingMode:
+            routingMode === "local_first"
+              ? "local_first_fulfillment"
+              : "imported_first_fulfillment",
         },
       };
       const fulfillmentOrders = await getFulfillmentOrdersWithRetry(orderId);
@@ -533,11 +559,10 @@ export default async function handler(req, res) {
           `Reconstructed capacity (local/imported): ${localCapacity}/${importedCapacity}`
         );
 
-        const { localQty, importedQty } = computeLocalFirstSplit(
-          orderedQty,
-          localCapacity,
-          importedCapacity
-        );
+        const { localQty, importedQty } =
+          routingMode === "local_first"
+            ? computeLocalFirstSplit(orderedQty, localCapacity, importedCapacity)
+            : computeImportedFirstSplit(orderedQty, localCapacity, importedCapacity);
 
         if (localQty + importedQty < orderedQty) {
           console.log(
@@ -550,10 +575,9 @@ export default async function handler(req, res) {
 
       console.log("📊 Split plan:", JSON.stringify(splitPlan));
 
-      await saveSplitPlan(orderId, splitPlan);
-
       if (!fulfillmentOrders.length) {
         console.log("⚠️ No fulfillment orders yet; skip rebalance (retry exhausted).");
+        await removeSplitPlanNoteAttribute(orderId);
         return res.status(200).send("OK");
       }
 
@@ -565,6 +589,9 @@ export default async function handler(req, res) {
         if (targetLocal === 0 && targetImported === 0) continue;
         await rebalanceVariantFulfillment(orderId, key, targetLocal, targetImported);
       }
+
+      // Do not persist split plan on note_attributes (Additional details). Strip if present.
+      await removeSplitPlanNoteAttribute(orderId);
 
       return res.status(200).send("OK");
     }
