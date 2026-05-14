@@ -13,7 +13,6 @@ export default async function handler(req, res) {
     const TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN;
     const LOCAL = process.env.LOCATION_LOCAL;
     const IMPORTED = process.env.LOCATION_IMPORTED;
-    const SPLIT_PLAN_ATTR = "inventory_split_plan_v1";
 
     function isAuthErrorMessage(value) {
       if (!value) return false;
@@ -263,82 +262,66 @@ export default async function handler(req, res) {
       return json;
     }
 
-    // 🔹 Save split plan to order note attributes
+    // 🔹 Save split plan to private metafield (not visible to customers)
     async function saveSplitPlan(orderId, splitPlan) {
       try {
-        const orderResponse = await fetch(
-          `https://${SHOP}/admin/api/2026-04/orders/${orderId}.json?fields=id,note_attributes`,
-          {
-            headers: {
-              "X-Shopify-Access-Token": TOKEN,
-            },
-          }
-        );
-        const orderJson = await orderResponse.json();
-        if (isLikelyAuthOrScopeFailure(orderResponse, orderJson)) {
-          throw new Error("Shopify Admin API authentication/scope check failed while reading order note attributes.");
-        }
-        if (!orderResponse.ok) {
-          throw buildAdminApiError("read order note attributes", orderResponse, orderJson);
-        }
-        const existingAttrs = orderJson?.order?.note_attributes || [];
-        const attrsWithoutSplitPlan = existingAttrs.filter(
-          (attr) => attr?.name !== SPLIT_PLAN_ATTR
-        );
-        const mergedNoteAttributes = [
-          ...attrsWithoutSplitPlan,
-          {
-            name: SPLIT_PLAN_ATTR,
+        const metafieldInput = {
+          metafield: {
+            namespace: "inventory",
+            key: "split_plan_v1",
             value: JSON.stringify(splitPlan),
-          },
-        ];
+            type: "json"
+          }
+        };
 
         const response = await fetch(
-          `https://${SHOP}/admin/api/2026-04/orders/${orderId}.json`,
+          `https://${SHOP}/admin/api/2026-04/orders/${orderId}/metafields.json`,
           {
-            method: "PUT",
+            method: "POST",
             headers: {
               "X-Shopify-Access-Token": TOKEN,
               "Content-Type": "application/json",
             },
-            body: JSON.stringify({
-              order: {
-                id: orderId,
-                note_attributes: mergedNoteAttributes,
-              },
-            }),
+            body: JSON.stringify(metafieldInput),
           }
         );
 
         const json = await response.json();
-        console.log("📝 Saved split plan status:", response.status);
+        console.log("📝 Saved split plan to metafield, status:", response.status);
 
         if (isLikelyAuthOrScopeFailure(response, json)) {
-          throw new Error("Shopify Admin API authentication/scope check failed while saving split plan.");
+          throw new Error("Shopify Admin API authentication/scope check failed while saving split plan metafield.");
         }
         if (!response.ok) {
-          throw buildAdminApiError("save split plan", response, json);
-        }
-
-        if (json?.errors) {
-          console.log("⚠️ Save split plan errors:", JSON.stringify(json.errors));
+          throw buildAdminApiError("save split plan metafield", response, json);
         }
       } catch (err) {
         console.log("⚠️ Failed to save split plan:", err.message);
       }
     }
 
-    // 🔹 Read split plan from order note attributes
-    function getSplitPlanFromNoteAttributes(noteAttributes) {
-      const attrs = noteAttributes || [];
-      const planAttr = attrs.find((attr) => attr?.name === SPLIT_PLAN_ATTR);
-
-      if (!planAttr?.value) return null;
-
+    // 🔹 Read split plan from private metafield
+    async function getSplitPlanFromMetafield(orderId) {
       try {
-        return JSON.parse(planAttr.value);
+        const response = await fetch(
+          `https://${SHOP}/admin/api/2026-04/orders/${orderId}/metafields.json?namespace=inventory&key=split_plan_v1`,
+          {
+            headers: {
+              "X-Shopify-Access-Token": TOKEN,
+            },
+          }
+        );
+
+        const json = await response.json();
+        
+        if (!response.ok || !json.metafields || json.metafields.length === 0) {
+          return null;
+        }
+
+        const metafield = json.metafields[0];
+        return JSON.parse(metafield.value);
       } catch (err) {
-        console.log("⚠️ Invalid split plan JSON:", err.message);
+        console.log("⚠️ Failed to read split plan metafield:", err.message);
         return null;
       }
     }
@@ -472,12 +455,27 @@ export default async function handler(req, res) {
     // ================================================================
     async function handleOrderCreate() {
       const orderId = data.id;
+      
+      // 🔥 CHECK: Is this an in-store pickup order?
+      const isPickupOrder = data.line_items?.some(item => 
+        item.fulfillment_service === "manual" || 
+        item.requires_shipping === false
+      ) || data.shipping_lines?.some(line => 
+        line.code?.toLowerCase().includes("pickup") || 
+        line.title?.toLowerCase().includes("pickup") ||
+        line.source?.toLowerCase().includes("pickup")
+      );
+      
+      console.log("🏪 Is pickup order:", isPickupOrder);
+      
       const splitPlan = {
         __meta: {
           inventoryAdjusted: false,
-          routingMode: "local_first_fulfillment",
+          routingMode: isPickupOrder ? "local_first_fulfillment" : "imported_only",
+          isPickup: isPickupOrder,
         },
       };
+      
       const fulfillmentOrders = await getFulfillmentOrdersWithRetry(orderId);
       const assignedByVariant = buildAssignedQtyByVariant(fulfillmentOrders);
 
@@ -533,11 +531,21 @@ export default async function handler(req, res) {
           `Reconstructed capacity (local/imported): ${localCapacity}/${importedCapacity}`
         );
 
-        const { localQty, importedQty } = computeLocalFirstSplit(
-          orderedQty,
-          localCapacity,
-          importedCapacity
-        );
+        // 🔥 NEW: If shipping order, force imported-only
+        let localQty, importedQty;
+        
+        if (isPickupOrder) {
+          // Original local-first logic for pickup orders
+          const split = computeLocalFirstSplit(orderedQty, localCapacity, importedCapacity);
+          localQty = split.localQty;
+          importedQty = split.importedQty;
+          console.log("🏪 Pickup order: using local-first split");
+        } else {
+          // Force imported stock only for shipping orders
+          localQty = 0;
+          importedQty = Math.min(orderedQty, importedCapacity);
+          console.log("📦 Shipping order: assigning from imported stock only");
+        }
 
         if (localQty + importedQty < orderedQty) {
           console.log(
@@ -576,8 +584,8 @@ export default async function handler(req, res) {
       const orderId = data.id;
       console.log("❌ Order cancelled:", orderId);
 
-      // ✅ PRIMARY: Use stored split plan
-      const splitPlan = getSplitPlanFromNoteAttributes(data.note_attributes);
+      // ✅ PRIMARY: Use stored split plan from metafield
+      const splitPlan = await getSplitPlanFromMetafield(orderId);
 
       if (splitPlan && Object.keys(splitPlan).length > 0) {
         const wasInventoryAdjusted =
@@ -658,15 +666,15 @@ export default async function handler(req, res) {
     // 🔀 ROUTE by topic
     // ================================================================
     if (topic === "orders/create") {
-  return await handleOrderCreate();
-}
+      return await handleOrderCreate();
+    }
 
-if (topic === "orders/cancelled") {
-  return await handleCancellation();
-}
+    if (topic === "orders/cancelled") {
+      return await handleCancellation();
+    }
 
-console.log("⏭ Ignored webhook topic:", topic);
-return res.status(200).send("Ignored");
+    console.log("⏭ Ignored webhook topic:", topic);
+    return res.status(200).send("Ignored");
 
   } catch (error) {
     console.error("❌ ERROR:", error);
