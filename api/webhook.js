@@ -66,280 +66,6 @@ export default async function handler(req, res) {
 
     assertConfig();
 
-    async function shopifyAdminGraphql(body) {
-      const response = await fetch(`https://${SHOP}/admin/api/2026-04/graphql.json`, {
-        method: "POST",
-        headers: {
-          "X-Shopify-Access-Token": TOKEN,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
-      const json = await response.json();
-      if (isLikelyAuthOrScopeFailure(response, json)) {
-        throw new Error("Shopify Admin API authentication/scope check failed (GraphQL).");
-      }
-      if (json.errors) {
-        console.log("❌ GraphQL errors:", JSON.stringify(json.errors));
-      }
-      return { response, json };
-    }
-
-    /**
-     * True when checkout looks like ship-to-address (UPS/carrier), not retail/local pickup.
-     * Used to prefer imported-first splits and to try merging pickup-labeled FOs into shipping FOs.
-     */
-    function orderLooksShippedToAddress(orderPayload) {
-      const attrs = orderPayload.note_attributes || [];
-      for (const a of attrs) {
-        const name = String(a?.name || "").toLowerCase();
-        const val = String(a?.value || "").toLowerCase();
-        if (
-          name.includes("shipping method") ||
-          name === "selected shipping method" ||
-          name.includes("delivery method")
-        ) {
-          if (!val) continue;
-          if (val.includes("pickup") || val.includes("pick up") || val.includes("collect")) {
-            return false;
-          }
-          if (
-            val.includes("ups") ||
-            val.includes("fedex") ||
-            val.includes("usps") ||
-            val.includes("dhl") ||
-            val.includes("ship")
-          ) {
-            return true;
-          }
-        }
-      }
-      for (const sl of orderPayload.shipping_lines || []) {
-        const t = String(sl.title || "").toLowerCase();
-        if (!t) continue;
-        if (
-          t.includes("pickup") ||
-          t.includes("pick up") ||
-          t.includes("in store") ||
-          t.includes("in-store") ||
-          t.includes("local delivery")
-        ) {
-          return false;
-        }
-        if (
-          t.includes("ups") ||
-          t.includes("fedex") ||
-          t.includes("usps") ||
-          t.includes("dhl") ||
-          t.includes("standard") ||
-          t.includes("express") ||
-          t.includes("ground") ||
-          t.includes("shipping") ||
-          t.includes("delivery")
-        ) {
-          return true;
-        }
-      }
-      return false;
-    }
-
-    function deliveryMethodIsPickup(dm) {
-      if (!dm) return false;
-      const type = String(dm.methodType || "");
-      if (type === "PICK_UP" || type === "PICKUP_POINT") return true;
-      const label = String(dm.presentedName || "").toLowerCase();
-      return label.includes("pickup") || label.includes("pick up") || label.includes("in store");
-    }
-
-    function getEffectiveRoutingMode(orderPayload) {
-      if (orderLooksShippedToAddress(orderPayload)) {
-        return "imported_first";
-      }
-      return String(process.env.INVENTORY_SPLIT_ROUTING || "local_first").toLowerCase() ===
-        "imported_first"
-        ? "imported_first"
-        : "local_first";
-    }
-
-    async function fetchFulfillmentOrdersGraphql(orderId) {
-      const orderGid = `gid://shopify/Order/${orderId}`;
-      const { json } = await shopifyAdminGraphql({
-        query: `
-          query ($orderId: ID!) {
-            order(id: $orderId) {
-              fulfillmentOrders(first: 30) {
-                nodes {
-                  id
-                  status
-                  deliveryMethod {
-                    methodType
-                    presentedName
-                  }
-                  assignedLocation {
-                    location {
-                      legacyResourceId
-                      name
-                    }
-                  }
-                }
-              }
-            }
-          }
-        `,
-        variables: { orderId: orderGid },
-      });
-      if (!json?.data?.order) {
-        console.log("⏭ GraphQL order not found or missing fulfillmentOrders for:", orderId);
-      }
-      return json?.data?.order?.fulfillmentOrders?.nodes || [];
-    }
-
-    async function fulfillmentOrderIdsMergeableWith(fulfillmentOrderGid) {
-      const { json } = await shopifyAdminGraphql({
-        query: `
-          query ($id: ID!) {
-            fulfillmentOrder(id: $id) {
-              fulfillmentOrdersForMerge(first: 20) {
-                nodes {
-                  id
-                }
-              }
-            }
-          }
-        `,
-        variables: { id: fulfillmentOrderGid },
-      });
-      const nodes = json?.data?.fulfillmentOrder?.fulfillmentOrdersForMerge?.nodes || [];
-      return new Set(nodes.map((n) => n.id));
-    }
-
-    async function mergeTwoFulfillmentOrders(foGidA, foGidB) {
-      const runOnce = async (first, second) => {
-        const { json } = await shopifyAdminGraphql({
-          query: `
-            mutation ($inputs: [FulfillmentOrderMergeInput!]!) {
-              fulfillmentOrderMerge(fulfillmentOrderMergeInputs: $inputs) {
-                fulfillmentOrderMerges {
-                  fulfillmentOrder {
-                    id
-                    status
-                    deliveryMethod {
-                      methodType
-                      presentedName
-                    }
-                  }
-                }
-                userErrors {
-                  field
-                  message
-                  code
-                }
-              }
-            }
-          `,
-          variables: {
-            inputs: [
-              {
-                mergeIntents: [
-                  { fulfillmentOrderId: first },
-                  { fulfillmentOrderId: second },
-                ],
-              },
-            ],
-          },
-        });
-        const payload = json?.data?.fulfillmentOrderMerge;
-        const userErrors = payload?.userErrors || [];
-        if (userErrors.length) {
-          console.log("⚠️ fulfillmentOrderMerge userErrors:", JSON.stringify(userErrors));
-          return false;
-        }
-        const merges = payload?.fulfillmentOrderMerges || [];
-        if (merges.length) {
-          console.log(
-            "✅ Merged fulfillment orders:",
-            JSON.stringify(merges.map((m) => m.fulfillmentOrder?.id))
-          );
-          return true;
-        }
-        return false;
-      };
-
-      if (await runOnce(foGidA, foGidB)) return true;
-      if (await runOnce(foGidB, foGidA)) return true;
-      return false;
-    }
-
-    /**
-     * When Shopify marks a pickup-type FO as mergeable with a carrier-shipping FO, merge them so
-     * the admin shows a single shipping method (e.g. UPS) instead of "In Store Pickup" on a split group.
-     */
-    async function tryMergePickupFulfillmentOrdersIntoShipping(orderId) {
-      const enabled = String(process.env.TRY_MERGE_PICKUP_FULFILLMENT_ORDERS ?? "1") !== "0";
-      if (!enabled || !orderLooksShippedToAddress(data)) return;
-
-      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-      try {
-        for (let attempt = 0; attempt < 6; attempt++) {
-          let nodes = await fetchFulfillmentOrdersGraphql(orderId);
-          nodes = (nodes || []).filter((n) => {
-            const st = String(n?.status || "").toUpperCase();
-            return st === "OPEN" || st === "SCHEDULED" || st === "ON_HOLD";
-          });
-          const pickupNodes = nodes.filter((n) => deliveryMethodIsPickup(n.deliveryMethod));
-          const shipNodes = nodes.filter((n) => !deliveryMethodIsPickup(n.deliveryMethod));
-          if (!pickupNodes.length) {
-            return;
-          }
-          if (!shipNodes.length) {
-            if (attempt === 0) {
-              console.log(
-                "⏭ Pickup-type fulfillment orders present but no merge partner with a shipping delivery method."
-              );
-            }
-            return;
-          }
-
-          const shipPreferImported = [...shipNodes].sort((a, b) => {
-            const la = String(a?.assignedLocation?.location?.legacyResourceId || "");
-            const lb = String(b?.assignedLocation?.location?.legacyResourceId || "");
-            if (la === String(IMPORTED) && lb !== String(IMPORTED)) return -1;
-            if (lb === String(IMPORTED) && la !== String(IMPORTED)) return 1;
-            return 0;
-          });
-
-          let mergedAny = false;
-          pickupLoop: for (const pickup of pickupNodes) {
-            const pickupId = pickup.id;
-            for (const ship of shipPreferImported) {
-              const shipId = ship.id;
-              if (pickupId === shipId) continue;
-
-              const mergeableFromShip = await fulfillmentOrderIdsMergeableWith(shipId);
-              const mergeableFromPickup = await fulfillmentOrderIdsMergeableWith(pickupId);
-              const canMerge =
-                mergeableFromShip.has(pickupId) ||
-                mergeableFromPickup.has(shipId);
-
-              if (!canMerge) continue;
-
-              const ok = await mergeTwoFulfillmentOrders(shipId, pickupId);
-              if (ok) {
-                mergedAny = true;
-                await sleep(400);
-                break pickupLoop;
-              }
-            }
-          }
-
-          if (!mergedAny) return;
-        }
-      } catch (err) {
-        console.log("⚠️ tryMergePickupFulfillmentOrdersIntoShipping:", err.message);
-      }
-    }
-
     // 🔥 GraphQL: Get inventory_item_id
     async function getInventoryItemId(variantId) {
       try {
@@ -537,11 +263,8 @@ export default async function handler(req, res) {
       return json;
     }
 
-    /**
-     * Remove inventory_split_plan_v1 from order note_attributes so it does not appear under
-     * Additional details. Preserves all other note attributes.
-     */
-    async function removeSplitPlanNoteAttribute(orderId) {
+    // 🔹 Save split plan to order note attributes
+    async function saveSplitPlan(orderId, splitPlan) {
       try {
         const orderResponse = await fetch(
           `https://${SHOP}/admin/api/2026-04/orders/${orderId}.json?fields=id,note_attributes`,
@@ -562,9 +285,13 @@ export default async function handler(req, res) {
         const attrsWithoutSplitPlan = existingAttrs.filter(
           (attr) => attr?.name !== SPLIT_PLAN_ATTR
         );
-        if (attrsWithoutSplitPlan.length === existingAttrs.length) {
-          return;
-        }
+        const mergedNoteAttributes = [
+          ...attrsWithoutSplitPlan,
+          {
+            name: SPLIT_PLAN_ATTR,
+            value: JSON.stringify(splitPlan),
+          },
+        ];
 
         const response = await fetch(
           `https://${SHOP}/admin/api/2026-04/orders/${orderId}.json`,
@@ -577,27 +304,27 @@ export default async function handler(req, res) {
             body: JSON.stringify({
               order: {
                 id: orderId,
-                note_attributes: attrsWithoutSplitPlan,
+                note_attributes: mergedNoteAttributes,
               },
             }),
           }
         );
 
         const json = await response.json();
-        console.log("📝 Removed split plan from note_attributes, status:", response.status);
+        console.log("📝 Saved split plan status:", response.status);
 
         if (isLikelyAuthOrScopeFailure(response, json)) {
-          throw new Error("Shopify Admin API authentication/scope check failed while updating order note attributes.");
+          throw new Error("Shopify Admin API authentication/scope check failed while saving split plan.");
         }
         if (!response.ok) {
-          throw buildAdminApiError("remove split plan note attribute", response, json);
+          throw buildAdminApiError("save split plan", response, json);
         }
 
         if (json?.errors) {
-          console.log("⚠️ Remove split plan errors:", JSON.stringify(json.errors));
+          console.log("⚠️ Save split plan errors:", JSON.stringify(json.errors));
         }
       } catch (err) {
-        console.log("⚠️ Failed to remove split plan from note_attributes:", err.message);
+        console.log("⚠️ Failed to save split plan:", err.message);
       }
     }
 
@@ -614,21 +341,6 @@ export default async function handler(req, res) {
         console.log("⚠️ Invalid split plan JSON:", err.message);
         return null;
       }
-    }
-
-    /**
-     * Imported first: assign up to IMPORTED capacity, remainder from LOCAL.
-     * Preferring IMPORTED first often keeps the larger fulfillment group on the warehouse FO that
-     * already has checkout shipping (e.g. UPS). Local-only remainder still follows that location's
-     * delivery profile in Shopify admin (pickup vs carrier).
-     */
-    function computeImportedFirstSplit(orderedQty, localCapacity, importedCapacity) {
-      const local = Math.max(0, Number(localCapacity) || 0);
-      const imported = Math.max(0, Number(importedCapacity) || 0);
-      const importedQty = Math.min(orderedQty, imported);
-      const remaining = orderedQty - importedQty;
-      const localQty = Math.min(remaining, local);
-      return { localQty, importedQty };
     }
 
     /**
@@ -685,9 +397,6 @@ export default async function handler(req, res) {
 
     /**
      * Move fulfillment quantities so assigned locations match target localQty / importedQty for this variant.
-     * For carrier-shipped orders, pickup-labeled fulfillment groups are handled after rebalance via
-     * tryMergePickupFulfillmentOrdersIntoShipping when Shopify allows merging FOs.
-     * Otherwise, labels follow each location's delivery profile in Shopify admin.
      */
     async function rebalanceVariantFulfillment(orderId, variantId, targetLocal, targetImported) {
       const maxIterations = 25;
@@ -763,14 +472,10 @@ export default async function handler(req, res) {
     // ================================================================
     async function handleOrderCreate() {
       const orderId = data.id;
-      const routingMode = getEffectiveRoutingMode(data);
       const splitPlan = {
         __meta: {
           inventoryAdjusted: false,
-          routingMode:
-            routingMode === "local_first"
-              ? "local_first_fulfillment"
-              : "imported_first_fulfillment",
+          routingMode: "local_first_fulfillment",
         },
       };
       const fulfillmentOrders = await getFulfillmentOrdersWithRetry(orderId);
@@ -828,10 +533,11 @@ export default async function handler(req, res) {
           `Reconstructed capacity (local/imported): ${localCapacity}/${importedCapacity}`
         );
 
-        const { localQty, importedQty } =
-          routingMode === "local_first"
-            ? computeLocalFirstSplit(orderedQty, localCapacity, importedCapacity)
-            : computeImportedFirstSplit(orderedQty, localCapacity, importedCapacity);
+        const { localQty, importedQty } = computeLocalFirstSplit(
+          orderedQty,
+          localCapacity,
+          importedCapacity
+        );
 
         if (localQty + importedQty < orderedQty) {
           console.log(
@@ -844,9 +550,10 @@ export default async function handler(req, res) {
 
       console.log("📊 Split plan:", JSON.stringify(splitPlan));
 
+      await saveSplitPlan(orderId, splitPlan);
+
       if (!fulfillmentOrders.length) {
         console.log("⚠️ No fulfillment orders yet; skip rebalance (retry exhausted).");
-        await removeSplitPlanNoteAttribute(orderId);
         return res.status(200).send("OK");
       }
 
@@ -858,11 +565,6 @@ export default async function handler(req, res) {
         if (targetLocal === 0 && targetImported === 0) continue;
         await rebalanceVariantFulfillment(orderId, key, targetLocal, targetImported);
       }
-
-      await tryMergePickupFulfillmentOrdersIntoShipping(orderId);
-
-      // Do not persist split plan on note_attributes (Additional details). Strip if present.
-      await removeSplitPlanNoteAttribute(orderId);
 
       return res.status(200).send("OK");
     }
