@@ -262,7 +262,7 @@ export default async function handler(req, res) {
       return json;
     }
 
-    // 🔹 Save split plan to private metafield (not visible to customers)
+    // 🔹 Save split plan to private metafield
     async function saveSplitPlan(orderId, splitPlan) {
       try {
         const metafieldInput = {
@@ -313,7 +313,7 @@ export default async function handler(req, res) {
         );
 
         const json = await response.json();
-        
+
         if (!response.ok || !json.metafields || json.metafields.length === 0) {
           return null;
         }
@@ -328,7 +328,6 @@ export default async function handler(req, res) {
 
     /**
      * Local first: assign up to LOCAL capacity, remainder from IMPORTED.
-     * Inventory is not adjusted via API — Shopify commits at checkout; we only move fulfillment lines.
      */
     function computeLocalFirstSplit(orderedQty, localCapacity, importedCapacity) {
       const local = Math.max(0, Number(localCapacity) || 0);
@@ -341,7 +340,6 @@ export default async function handler(req, res) {
 
     /**
      * Build current order assignment map by variant from fulfillment orders.
-     * This lets us reconstruct pre-order capacity as: available + assigned_for_this_order.
      */
     function buildAssignedQtyByVariant(fulfillmentOrders) {
       const assigned = {};
@@ -379,75 +377,100 @@ export default async function handler(req, res) {
     }
 
     /**
-     * Move fulfillment quantities so assigned locations match target localQty / importedQty for this variant.
+     * Two-pass rebalance so both resulting FOs inherit the same delivery method.
+     *
+     * Pass 1 — move everything to LOCAL first.
+     *   Shopify creates the "moved" FO from a LOCAL context, so it inherits
+     *   the pickup / selected service from the Local FO.
+     *
+     * Pass 2 — move the overflow back to IMPORTED.
+     *   Because the source is now a LOCAL FO (with the correct service),
+     *   the new Imported FO also inherits that service instead of the
+     *   original UPS method assigned at checkout.
+     *
+     * Result: both Local and Imported FOs show the same service the
+     * customer selected (pickup, UPS, etc.).
      */
     async function rebalanceVariantFulfillment(orderId, variantId, targetLocal, targetImported) {
       const maxIterations = 25;
-      for (let iter = 0; iter < maxIterations; iter++) {
-        const fos = await getFulfillmentOrders(orderId);
-        let curLocal = 0;
-        let curImported = 0;
-        const atLocal = [];
-        const atImported = [];
 
-        for (const fo of fos) {
-          const loc = String(fo.assigned_location_id);
-          for (const foLine of fo.line_items || []) {
-            if (String(foLine.variant_id) !== String(variantId)) continue;
-            const q = Number(
-              foLine.fulfillable_quantity ?? foLine.quantity ?? 0
-            );
-            if (q <= 0) continue;
-            if (loc === String(LOCAL)) {
-              curLocal += q;
-              atLocal.push({ fo, foLine, q });
-            } else if (loc === String(IMPORTED)) {
+      // ── PASS 1: Move everything to LOCAL first ──────────────────────────
+      if (targetImported > 0) {
+        for (let iter = 0; iter < maxIterations; iter++) {
+          const fos = await getFulfillmentOrders(orderId);
+          let curImported = 0;
+          const atImported = [];
+
+          for (const fo of fos) {
+            if (String(fo.assigned_location_id) !== String(IMPORTED)) continue;
+            for (const foLine of fo.line_items || []) {
+              if (String(foLine.variant_id) !== String(variantId)) continue;
+              const q = Number(foLine.fulfillable_quantity ?? foLine.quantity ?? 0);
+              if (q <= 0) continue;
               curImported += q;
               atImported.push({ fo, foLine, q });
             }
           }
-        }
 
-        if (curLocal === targetLocal && curImported === targetImported) {
-          console.log(
-            `✅ Fulfillment balanced for variant ${variantId}: Local ${curLocal}, Imported ${curImported}`
-          );
-          return;
-        }
-
-        const needToLocal = targetLocal - curLocal;
-        if (needToLocal > 0) {
-          for (const { fo, foLine, q } of atImported) {
-            const moveQty = Math.min(needToLocal, q);
-            if (moveQty <= 0) continue;
-            console.log(
-              `🚚 Move ${moveQty} of variant ${variantId} IMPORTED → LOCAL (need ${needToLocal})`
-            );
-            await moveFulfillmentLineItem(fo.id, foLine.id, moveQty, LOCAL);
+          if (curImported === 0) {
+            console.log(`✅ Pass 1 done: all of variant ${variantId} now at Local`);
             break;
           }
-          continue;
-        }
 
-        const needToImported = targetImported - curImported;
-        if (needToImported > 0) {
+          for (const { fo, foLine, q } of atImported) {
+            console.log(`🚚 Pass 1: Move ${q} of variant ${variantId} IMPORTED → LOCAL`);
+            await moveFulfillmentLineItem(fo.id, foLine.id, q, LOCAL);
+            break;
+          }
+        }
+      }
+
+      // ── PASS 2: Move overflow back to IMPORTED ──────────────────────────
+      if (targetImported > 0) {
+        for (let iter = 0; iter < maxIterations; iter++) {
+          const fos = await getFulfillmentOrders(orderId);
+          let curLocal = 0;
+          const atLocal = [];
+
+          for (const fo of fos) {
+            if (String(fo.assigned_location_id) !== String(LOCAL)) continue;
+            for (const foLine of fo.line_items || []) {
+              if (String(foLine.variant_id) !== String(variantId)) continue;
+              const q = Number(foLine.fulfillable_quantity ?? foLine.quantity ?? 0);
+              if (q <= 0) continue;
+              curLocal += q;
+              atLocal.push({ fo, foLine, q });
+            }
+          }
+
+          const excessLocal = curLocal - targetLocal;
+          if (excessLocal <= 0) {
+            console.log(`✅ Pass 2 done: variant ${variantId} Local ${curLocal}, Imported target met`);
+            break;
+          }
+
           for (const { fo, foLine, q } of atLocal) {
-            const moveQty = Math.min(needToImported, q);
-            if (moveQty <= 0) continue;
-            console.log(
-              `🚚 Move ${moveQty} of variant ${variantId} LOCAL → IMPORTED (need ${needToImported})`
-            );
+            const moveQty = Math.min(excessLocal, q);
+            console.log(`🚚 Pass 2: Move ${moveQty} of variant ${variantId} LOCAL → IMPORTED`);
             await moveFulfillmentLineItem(fo.id, foLine.id, moveQty, IMPORTED);
             break;
           }
-          continue;
         }
-
-        console.log(
-          `⚠️ Cannot fully rebalance variant ${variantId}: targets Local ${targetLocal} Imported ${targetImported}, current Local ${curLocal} Imported ${curImported}`
-        );
-        return;
       }
+
+      // ── Final verification log ──────────────────────────────────────────
+      const fos = await getFulfillmentOrders(orderId);
+      let finalLocal = 0, finalImported = 0;
+      for (const fo of fos) {
+        const loc = String(fo.assigned_location_id);
+        for (const foLine of fo.line_items || []) {
+          if (String(foLine.variant_id) !== String(variantId)) continue;
+          const q = Number(foLine.fulfillable_quantity ?? foLine.quantity ?? 0);
+          if (loc === String(LOCAL)) finalLocal += q;
+          else if (loc === String(IMPORTED)) finalImported += q;
+        }
+      }
+      console.log(`✅ Final balance for variant ${variantId}: Local ${finalLocal}, Imported ${finalImported}`);
     }
 
     // ================================================================
@@ -455,19 +478,19 @@ export default async function handler(req, res) {
     // ================================================================
     async function handleOrderCreate() {
       const orderId = data.id;
-      
+
       // 🔥 CHECK: Is this an in-store pickup order?
-      const isPickupOrder = data.line_items?.some(item => 
-        item.fulfillment_service === "manual" || 
+      const isPickupOrder = data.line_items?.some(item =>
+        item.fulfillment_service === "manual" ||
         item.requires_shipping === false
-      ) || data.shipping_lines?.some(line => 
-        line.code?.toLowerCase().includes("pickup") || 
+      ) || data.shipping_lines?.some(line =>
+        line.code?.toLowerCase().includes("pickup") ||
         line.title?.toLowerCase().includes("pickup") ||
         line.source?.toLowerCase().includes("pickup")
       );
-      
+
       console.log("🏪 Is pickup order:", isPickupOrder);
-      
+
       const splitPlan = {
         __meta: {
           inventoryAdjusted: false,
@@ -475,7 +498,7 @@ export default async function handler(req, res) {
           isPickup: isPickupOrder,
         },
       };
-      
+
       const fulfillmentOrders = await getFulfillmentOrdersWithRetry(orderId);
       const assignedByVariant = buildAssignedQtyByVariant(fulfillmentOrders);
 
@@ -514,15 +537,11 @@ export default async function handler(req, res) {
 
         console.log(
           "Local (on_hand/available/committed):",
-          localQ.on_hand,
-          localQ.available,
-          localQ.committed
+          localQ.on_hand, localQ.available, localQ.committed
         );
         console.log(
           "Imported (on_hand/available/committed):",
-          importedQ.on_hand,
-          importedQ.available,
-          importedQ.committed
+          importedQ.on_hand, importedQ.available, importedQ.committed
         );
         console.log(
           `Current order assigned from FO (local/imported): ${assigned.local}/${assigned.imported}`
@@ -531,11 +550,10 @@ export default async function handler(req, res) {
           `Reconstructed capacity (local/imported): ${localCapacity}/${importedCapacity}`
         );
 
-        // 🔥 NEW: If shipping order, force imported-only
         let localQty, importedQty;
-        
+
         if (isPickupOrder) {
-          // Original local-first logic for pickup orders
+          // Local-first logic for pickup orders
           const split = computeLocalFirstSplit(orderedQty, localCapacity, importedCapacity);
           localQty = split.localQty;
           importedQty = split.importedQty;
@@ -601,7 +619,6 @@ export default async function handler(req, res) {
         console.log("📦 Using stored split plan for restock");
 
         for (const item of data.line_items || []) {
-
           const variantId = item.variant_id;
           const plan = splitPlan[variantId];
 
@@ -636,7 +653,6 @@ export default async function handler(req, res) {
 
       for (const refund of refunds) {
         for (const refundItem of refund.refund_line_items || []) {
-
           if (refundItem.restock_type !== "cancel") continue;
 
           const locationId = refundItem.location_id;
